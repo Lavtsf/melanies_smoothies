@@ -1,68 +1,92 @@
 # Import python packages
 import streamlit as st
-from snowflake.snowpark.context import get_active_session
 from snowflake.snowpark.functions import col
+import requests
+import pandas as pd
+import math
 
-# Write directly to the app
-st.title("🥛Customize Your Smoothie!🥛")
-st.write(
-    "Choose the fruits you want in your custom Smoothie!"
-)
+st.title("🥤 Customize Your Smoothie 🥤")
+st.write("Choose the fruits you want in your custom smoothie")
 
-# option = st.selectbox(
-#     "How would you like to be contacted",
-#     ('Email', 'Home phone', 'Mobile phone')
-# )
+# Name input
+name_on_order = st.text_input("Name on Smoothie", "Life of Brian")
+st.write("The name on your smoothie will be:", name_on_order)
 
-# st.write('Your selected', option)
-
-# fruit_option = st.selectbox(
-#     "What is your favorite Fruit?",
-#     ('Banana', 'Strawberries', 'Peaches')
-# )
-
-# st.write('Your Favorite Fruit is: ', fruit_option)
-
-#session = get_active_session()
-# st.write(session)
-#my_dataframe = session.table("smoothies.public.fruit_options").select(col('FRUIT_NAME'))
-# st.dataframe(data=my_dataframe, use_container_width=True)
-
+# Snowflake connection
 cnx = st.connection("snowflake")
 session = cnx.session()
 
-my_dataframe = session.table("smoothies.public.fruit_options").select(col('FRUIT_NAME'))
-
-name_on_order = st.text_input("Name on Smoothie:")
-st.write("The name in your Smoothie will be: ", name_on_order)
-
-
-
-# list data type
-ingredients_list = st.multiselect(
- 'Choose up to 5 ingredients: ',  my_dataframe, max_selections = 5
+# Fetch fruit options from Snowflake
+snow_df = session.table("smoothies.public.fruit_options").select(
+    col("FRUIT_NAME"), col("SEARCH_ON")
 )
 
+# Convert Snowpark DataFrame to Pandas and index by FRUIT_NAME for fast lookup
+pd_df = snow_df.to_pandas().drop_duplicates(subset=["FRUIT_NAME"])
+pd_df = pd_df.set_index("FRUIT_NAME", drop=False)
+
+# Multiselect on fruit names
+ingredients_list = st.multiselect(
+    "Choose up to 5 ingredients:",
+    options=pd_df["FRUIT_NAME"].tolist(),
+    max_selections=5
+)
 
 if ingredients_list:
-    ingredients_string = ''
-#     st.write("You selected:", ingredients_list)
-#     st.text(ingredients_list)
-    for element in ingredients_list:
-        ingredients_string += element + ' '
-    # st.write(ingredients_string)
+    # Build a nice comma-separated list for storage
+    ingredients_string = ", ".join(ingredients_list)
 
-    my_insert_stmt = """ insert into smoothies.public.orders(ingredients, name_on_order)
-                values ('"""\
-                + ingredients_string + """','""" + name_on_order + """'
-                )"""
-    # st.write(my_insert_stmt)
-    # st.stop()
-    
-    time_to_insert = st.button('Submit Order')
-        
-    # st.write(my_insert_stmt)
-    
-    if time_to_insert:
-        session.sql(my_insert_stmt).collect()
-        st.success('Your Smoothie is ordered!', icon="✅")
+    for fruit_chosen in ingredients_list:
+        # Ensure the chosen fruit exists in the dataframe
+        if fruit_chosen not in pd_df.index:
+            st.warning(f"'{fruit_chosen}' not found in options. Skipping.")
+            continue
+
+        # Get search key and CAST TO STRING safely
+        search_on_value = pd_df.at[fruit_chosen, "SEARCH_ON"]
+
+        # Guard against NaN/None
+        if search_on_value is None or (isinstance(search_on_value, float) and math.isnan(search_on_value)):
+            st.warning(f"No SEARCH_ON value for '{fruit_chosen}'. Skipping nutrition lookup.")
+            continue
+
+        search_on = str(search_on_value).strip()
+        if not search_on:
+            st.warning(f"Empty SEARCH_ON for '{fruit_chosen}'. Skipping.")
+            continue
+
+        # Show nutrition info
+        st.subheader(f"{fruit_chosen} — Nutrition Information")
+        url = f"https://my.smoothiefroot.com/api/fruit/{search_on}"
+
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Normalize JSON to a dataframe for display
+            if isinstance(data, dict):
+                df = pd.json_normalize(data)
+            else:
+                df = pd.DataFrame(data)
+
+            st.dataframe(df, use_container_width=True)
+        except Exception as e:
+            st.error(f"Failed to fetch nutrition for {fruit_chosen}: {e}")
+
+    # Prepare and execute insert (escape single quotes)
+    name_sql = name_on_order.replace("'", "''")
+    ingredients_sql = ingredients_string.replace("'", "''")
+
+    insert_sql = f"""
+        INSERT INTO smoothies.public.orders (ingredients, NAME_ON_ORDER)
+        VALUES ('{ingredients_sql}', '{name_sql}')
+    """
+
+    st.code(insert_sql, language="sql")
+    if st.button("Submit Order"):
+        try:
+            session.sql(insert_sql).collect()
+            st.success("Your Smoothie is ordered!", icon="✅")
+        except Exception as e:
+            st.error(f"Insert failed: {e}")
